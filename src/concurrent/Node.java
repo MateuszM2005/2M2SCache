@@ -8,6 +8,22 @@ package concurrent;
  */
 public class Node<K, V> {
     /**
+     * Queue sentinel. Head and tail guards carry this and are never cache entries.
+     */
+    static final byte LOC_SENTINEL = -2;
+    /**
+     * Not currently a member of any queue.
+     */
+    static final byte LOC_UNLINKED = -1;
+    /**
+     * Admitted to the map but not yet drained into a queue.
+     */
+    static final byte LOC_NEW = 0;
+    static final byte LOC_WINDOW = 1;
+    static final byte LOC_PROBATION = 2;
+    static final byte LOC_PROTECTED = 3;
+
+    /**
      * The key of the node.
      */
     final K key;
@@ -22,10 +38,9 @@ public class Node<K, V> {
     /**
      * The hash code of the key.
      */
-    int hash;
+    final int hash;
     /**
-     * The type of queue the node belongs to.
-     * 0 for probation, 1 for protected.
+     * Which queue currently holds this node, as one of the {@code LOC_} constants.
      */
     byte queueType;
     /**
@@ -41,7 +56,7 @@ public class Node<K, V> {
     Node(K key, V value) {
         this.key = key;
         this.value = value;
-        this.queueType = 0;
+        this.queueType = LOC_NEW;
         this.hash = key.hashCode();
     }
 
@@ -50,6 +65,7 @@ public class Node<K, V> {
      */
     Node() {
         this.key = null;
-        this.queueType = -1;
+        this.hash = 0;
+        this.queueType = LOC_SENTINEL;
     }
 }

@@ -34,11 +34,11 @@ class Queue<K, V> {
 
         head.next = tail;
         head.isDeleted = false;
-        head.queueType = -2;
+        head.queueType = Node.LOC_SENTINEL;
 
         tail.prev = head;
         tail.isDeleted = false;
-        tail.queueType = -2;
+        tail.queueType = Node.LOC_SENTINEL;
     }
 
     /**

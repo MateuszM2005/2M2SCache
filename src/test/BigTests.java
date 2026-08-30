@@ -89,6 +89,9 @@ public class BigTests {
         System.out.printf("  - Duration: %.2f seconds\n", durationSeconds);
         System.out.printf("  - Throughput: %,.2f ops/sec\n", throughput);
         System.out.printf("  - Final Cache Size: %,d\n", cache.size());
-        assertTrue(cache.size() <= (int)(capacity * 1.09) + numThreads, "Cache size exceeded expected capacity.");
+        // The buffer holds up to 4096 entries that are in the map but not yet subject to eviction.
+        int maxSize = capacity + 4096 + numThreads;
+        assertTrue(cache.size() <= maxSize,
+                "Cache size (" + cache.size() + ") exceeded its maximum (" + maxSize + ").");
     }
 }

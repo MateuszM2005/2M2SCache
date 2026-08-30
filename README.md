@@ -2,7 +2,7 @@
 
 A high-concurrency Java cache with a three-queue eviction policy (window, probation, protected), inspired by Segmented LRU / LIRS-style admission. Updates are batched through a lock-free buffer; a Count-Min Sketch estimates frequency for eviction decisions.
 
-Requires **JDK 24** (uses `jdk.internal.vm.annotation.Contended`).
+Requires **JDK 17 or newer**. CI builds on 24.
 
 ## Public API
 
@@ -19,58 +19,63 @@ Requires **JDK 24** (uses `jdk.internal.vm.annotation.Contended`).
 
 See [src/concurrent/README.md](src/concurrent/README.md) for architecture details.
 
-## Build a JAR
+## Build
 
-From the repository root (PowerShell or bash):
+From the repository root:
 
 ```bash
 mkdir -p out/classes
-javac --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
-  -d out/classes \
-  src/Main.java \
-  src/concurrent/*.java
-jar --create --file 2M2SCache.jar --main-class Main -C out/classes .
+javac -d out/classes src/concurrent/*.java
 ```
 
-On Windows PowerShell:
+PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force -Path out\classes | Out-Null
-javac --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED -d out\classes src\Main.java src\concurrent\*.java
-jar --create --file 2M2SCache.jar --main-class Main -C out\classes .
+javac -d out\classes src\concurrent\*.java
 ```
-
-Run:
-
-```bash
-java --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED -jar 2M2SCache.jar
-```
-
-IntelliJ: open this folder as a project (module `Cacher`). `Cacher.iml` is committed so source roots and JUnit 6 stay shared. Compiler extra options already include the `--add-exports` flag.
 
 ## Tests
 
-JUnit 6 tests live under `src/test/` and are not packaged into the JAR.
+JUnit 6 tests live under `src/test/`.
 
-- `SmallTests` / `MediumTests`: run in CI and in IntelliJ
+- `SmallTests` / `MediumTests`: run in CI and locally by default
 - `BigTests` / `Benchmark`: `@Disabled` by default (long / resource-heavy)
 
-From the command line, after compiling production classes:
+### Local runs (recommended)
+
+`tools/run-tests.ps1` needs nothing but a JDK on `PATH`. It downloads the JUnit console
+launcher into `tools/lib/` on first use and then compiles and runs the same way CI does.
+
+```powershell
+.\tools\run-tests.ps1                         # SmallTests + MediumTests (~35 s)
+.\tools\run-tests.ps1 -Class test.SmallTests  # fast feedback (~4 s)
+.\tools\run-tests.ps1 -CompileOnly            # type-check only
+.\tools\run-tests.ps1 -Clean                  # rebuild from scratch
+.\tools\run-tests.ps1 -Method 'test.SmallTests#testValueUpdate'
+.\tools\run-tests.ps1 -Class test.Benchmark -IncludeDisabled
+```
+
+`-IncludeDisabled` deactivates the JUnit condition that honours `@Disabled`, which is how
+`BigTests` and `Benchmark` can be run without editing annotations. JUnit XML reports land in
+`out/test-reports/`.
+
+### Manual invocation
+
+If you would rather drive `javac` yourself, after compiling production classes:
 
 ```bash
 curl -fsSL -o junit-platform-console-standalone.jar \
   https://repo1.maven.org/maven2/org/junit/platform/junit-platform-console-standalone/6.0.0/junit-platform-console-standalone-6.0.0.jar
 mkdir -p out/test-classes
-javac --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
-  -cp junit-platform-console-standalone.jar:out/classes \
+javac -cp junit-platform-console-standalone.jar:out/classes \
   -d out/test-classes \
   src/test/*.java
-java --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
-  -jar junit-platform-console-standalone.jar execute \
+java -ea -jar junit-platform-console-standalone.jar execute \
   --class-path out/classes:out/test-classes \
-  --scan-class-path
+  --scan-class-path=out/test-classes
 ```
 
 ## CI
 
-GitHub Actions (`.github/workflows/build.yml`) compiles the library, runs JUnit tests, and uploads `2M2SCache.jar` as a workflow artifact. The JAR is only uploaded if tests pass.
+GitHub Actions (`.github/workflows/build.yml`) compiles the library and runs JUnit tests.

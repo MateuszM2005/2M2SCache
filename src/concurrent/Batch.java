@@ -2,68 +2,89 @@ package concurrent;
 
 /**
  * 2M2S doc
- * A thread-local batch for collecting hash codes before incrementing their
- * frequency in the {@link Sketch}. This helps to reduce contention on the sketch
- * by batching updates from a single thread.
+ * A thread-local batch of observed accesses, applied to the {@link Sketch} in one go.
+ *
+ * Repeated accesses to the same key are folded into a single entry, so a burst on a few
+ * hot keys costs a handful of compare-and-set operations instead of one per access. The
+ * sample total is reported once per flush rather than once per access, which keeps the
+ * sketch's single shared counter off the hot path.
  *
  * This class is intended to be used with {@link ThreadLocal}, so it does not
  * require any internal thread safety mechanisms.
- *
- * @param <K> The type of the key, although it is not directly used, it's kept for
- *           consistency with the cache's generic types.
  */
-class Batch<K> {
-    final int CAPACITY = 256;
-    @SuppressWarnings("unchecked")
-    private final int[] keys = new int[CAPACITY];
-    private int size = 0;
-
+class Batch {
     /**
-     * Adds a hash code to the batch. If the batch is full, the hash is ignored.
-     * @param hash The hash code to add.
+     * Slots in the fold table. A power of two, so {@link #MASK} can replace a modulo.
      */
-    void add(int hash) {
-        if (size < keys.length) {
-            keys[size++] = hash;
-        }
-    }
-
+    private static final int CAPACITY = 256;
+    private static final int MASK = CAPACITY - 1;
     /**
-     * Flushes all hash codes in the batch to the sketch, incrementing their
-     * frequencies, and then resets the batch.
-     * @param sketch The sketch to update.
+     * Flush once half the slots are taken, which keeps the linear probe in
+     * {@link #add} short and guarantees a free slot for every insert.
      */
-    void flush(Sketch sketch) {
-        for (int i = 0; i < size; i++) {
-            sketch.increment(keys[i]);
-        }
-        reset();
-    }
+    private static final int MAX_DISTINCT = CAPACITY / 2;
+    /**
+     * Flush after this many accesses even when they all fold into one slot, so a
+     * single hot key cannot delay the sketch indefinitely.
+     */
+    private static final int MAX_TOTAL = CAPACITY;
+
+    private final int[] hashes = new int[CAPACITY];
+    private final int[] counts = new int[CAPACITY];
+    private int distinct;
+    private int total;
 
     /**
-     * Adds a hash code to the batch and flushes the batch to the sketch if it is full.
-     * @param hash The hash code to add.
-     * @param sketch The sketch to update if the batch becomes full.
+     * Records one access, flushing to the sketch if the batch is full.
+     *
+     * @param hash The hash code to record.
+     * @param sketch The sketch to update once the batch fills up.
      */
     void increment(int hash, Sketch sketch) {
         add(hash);
-        if (full()) {
+        if (distinct >= MAX_DISTINCT || total >= MAX_TOTAL) {
             flush(sketch);
         }
     }
 
     /**
-     * Checks if the batch is full.
-     * @return {@code true} if the batch is full, {@code false} otherwise.
+     * Folds an access into the table, keeping one entry per distinct hash.
+     * A zero count marks a free slot, so any hash value is storable.
      */
-    boolean full() {
-        return size == keys.length;
+    private void add(int hash) {
+        int slot = Sketch.spread(hash) & MASK;
+        while (counts[slot] != 0) {
+            if (hashes[slot] == hash) {
+                counts[slot]++;
+                total++;
+                return;
+            }
+            slot = (slot + 1) & MASK;
+        }
+        hashes[slot] = hash;
+        counts[slot] = 1;
+        distinct++;
+        total++;
     }
 
     /**
-     * Resets the batch, clearing it for reuse.
+     * Applies every folded access to the sketch, then clears the batch for reuse.
+     *
+     * @param sketch The sketch to update.
      */
-    void reset() {
-        size = 0;
+    void flush(Sketch sketch) {
+        if (total == 0) {
+            return;
+        }
+        for (int slot = 0; slot < CAPACITY; slot++) {
+            int count = counts[slot];
+            if (count != 0) {
+                sketch.increment(hashes[slot], count);
+                counts[slot] = 0;
+            }
+        }
+        sketch.addSamples(total);
+        distinct = 0;
+        total = 0;
     }
 }

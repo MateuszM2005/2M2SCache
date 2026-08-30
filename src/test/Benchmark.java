@@ -9,157 +9,160 @@ import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 /**
  * 2M2S doc
  * Performance benchmarks comparing Cache2M2S to other cache implementations.
  * These tests provide insights into throughput and hit-rate performance.
  * They are disabled by default and should be run manually for analysis.
+ *
+ * Throughput is measured across a range of thread counts. A single-threaded number says
+ * nothing about a design whose whole purpose is to amortize maintenance across threads;
+ * the interesting question is the shape of the curve.
+ *
+ * Worker threads count operations locally and publish once at the end. Sharing a counter
+ * per operation would make the benchmark measure that counter.
  */
 @Disabled("Benchmarks are disabled by default and should be run manually.")
 @Timeout(value = 5, unit = TimeUnit.MINUTES)
 public class Benchmark {
 
-    private ExecutorService executor;
-    //private final int numThreads = Math.max(8, Runtime.getRuntime().availableProcessors());
-    private final int numThreads = 1;
-
-    @BeforeEach
-    void setUp() {
-        executor = Executors.newFixedThreadPool(numThreads);
-    }
-
-    @AfterEach
-    void tearDown() {
-        executor.shutdownNow();
-    }
+    private static final int THROUGHPUT_SECONDS = 3;
+    private static final int HIT_RATE_SECONDS = 10;
 
     @Test
     void compareThroughputWithConcurrentHashMap() throws InterruptedException {
-        System.out.println("--- Throughput Benchmark ---");
-        int testDurationSeconds = 10;
-        int keyRange = 1_000_000;
+        final int keyRange = 1_000_000;
+        final int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors());
 
-        // Benchmark Cache2M2S
-        System.out.println("Benchmarking Cache2M2S...");
-        Cache2M2S<Integer, String> cache2m2s = new Cache2M2S<>(keyRange);
-        long cache2m2sOps = runBenchmark(keyRange, testDurationSeconds, (key, value) -> {
-            if (ThreadLocalRandom.current().nextBoolean()) {
-                cache2m2s.put(key, value);
-            } else {
-                cache2m2s.get(key);
-            }
-        });
-        System.out.printf("Cache2M2S Throughput: %,.2f ops/sec\n\n", (double) cache2m2sOps / testDurationSeconds);
+        System.out.println("--- Throughput scaling (50% get / 50% put, uniform keys) ---");
+        System.out.printf("%-8s %20s %20s %8s%n", "threads", "Cache2M2S ops/s", "CHM ops/s", "ratio");
 
-        // Benchmark ConcurrentHashMap
-        System.out.println("Benchmarking ConcurrentHashMap...");
-        ConcurrentHashMap<Integer, String> chm = new ConcurrentHashMap<>(keyRange);
-        long chmOps = runBenchmark(keyRange, testDurationSeconds, (key, value) -> {
-            if (ThreadLocalRandom.current().nextBoolean()) {
-                chm.put(key, value);
-            } else {
-                chm.get(key);
-            }
-        });
-        System.out.printf("ConcurrentHashMap Throughput: %,.2f ops/sec\n\n", (double) chmOps / testDurationSeconds);
+        for (int threads = 1; threads <= maxThreads; threads *= 2) {
+            final Cache2M2S<Integer, String> cache = new Cache2M2S<>(keyRange);
+            double cacheOps = measureThroughput(threads, () -> {
+                int key = ThreadLocalRandom.current().nextInt(keyRange);
+                if (ThreadLocalRandom.current().nextBoolean()) {
+                    cache.put(key, "value-" + key);
+                } else {
+                    cache.get(key);
+                }
+            });
+
+            final ConcurrentHashMap<Integer, String> chm = new ConcurrentHashMap<>(keyRange);
+            double chmOps = measureThroughput(threads, () -> {
+                int key = ThreadLocalRandom.current().nextInt(keyRange);
+                if (ThreadLocalRandom.current().nextBoolean()) {
+                    chm.put(key, "value-" + key);
+                } else {
+                    chm.get(key);
+                }
+            });
+
+            System.out.printf("%-8d %,20.0f %,20.0f %8.2f%n", threads, cacheOps, chmOps, cacheOps / chmOps);
+        }
     }
 
     @Test
     void compareHitRateWithSimpleLruCache() throws InterruptedException {
-        System.out.println("--- Hit-Rate Benchmark (Zipfian Distribution) ---");
-        int capacity = 100_000;
-        int keyRange = 200_000; // Key range larger than capacity to force evictions
-        int testDurationSeconds = 15;
+        final int capacity = 100_000;
+        final int keyRange = 200_000; // Key range larger than capacity to force evictions
+        final ZipfKeys zipf = new ZipfKeys(keyRange, 0.99, 1 << 20);
 
-        // Benchmark Cache2M2S
-        System.out.println("Benchmarking Cache2M2S...");
-        Cache2M2S<Integer, String> cache2m2s = new Cache2M2S<>(capacity);
-        long[] cache2m2sStats = runHitRateBenchmark(capacity, keyRange, testDurationSeconds, cache2m2s::put, cache2m2s::get);
-        System.out.printf("Cache2M2S Hit Rate: %.2f%% (Hits: %,d, Misses: %,d)\n\n",
-                100.0 * cache2m2sStats[0] / (cache2m2sStats[0] + cache2m2sStats[1]), cache2m2sStats[0], cache2m2sStats[1]);
+        System.out.println("--- Hit rate, read-through, Zipfian keys, single thread ---");
+        System.out.printf("keys %,d over capacity %,d, %,d distinct keys drawn%n",
+                keyRange, capacity, zipf.distinctKeys());
 
-        // Benchmark simple LRU Cache
-        System.out.println("Benchmarking Simple LRU Cache...");
-        Map<Integer, String> lruCache = Collections.synchronizedMap(new LinkedHashMap<Integer, String>(capacity, 0.75f, true) {
-            @Override
-            protected boolean removeEldestEntry(Map.Entry<Integer, String> eldest) {
-                return size() > capacity;
-            }
-        });
-        long[] lruStats = runHitRateBenchmark(capacity, keyRange, testDurationSeconds, lruCache::put, lruCache::get);
-        System.out.printf("Simple LRU Cache Hit Rate: %.2f%% (Hits: %,d, Misses: %,d)\n\n",
-                100.0 * lruStats[0] / (lruStats[0] + lruStats[1]), lruStats[0], lruStats[1]);
+        Cache2M2S<Integer, String> cache = new Cache2M2S<>(capacity);
+        long[] cacheStats = measureHitRate(zipf, cache::get, cache::put);
+        report("Cache2M2S", cacheStats);
+
+        Map<Integer, String> lru = Collections.synchronizedMap(
+                new LinkedHashMap<Integer, String>(capacity, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<Integer, String> eldest) {
+                        return size() > capacity;
+                    }
+                });
+        long[] lruStats = measureHitRate(zipf, lru::get, lru::put);
+        report("LinkedHashMap LRU", lruStats);
     }
 
+    private static void report(String label, long[] stats) {
+        long hits = stats[0];
+        long misses = stats[1];
+        System.out.printf("%-20s hit rate %6.2f%%  (hits %,d / reads %,d)%n",
+                label, 100.0 * hits / (hits + misses), hits, hits + misses);
+    }
 
     // --- Helper Methods ---
 
-    private long runBenchmark(int keyRange, int duration, BiConsumer<Integer, String> operation) throws InterruptedException {
-        AtomicBoolean isRunning = new AtomicBoolean(true);
+    /**
+     * Runs {@code operation} on {@code threads} workers for a fixed duration.
+     *
+     * @return operations per second across all threads
+     */
+    private static double measureThroughput(int threads, Runnable operation) throws InterruptedException {
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        AtomicBoolean running = new AtomicBoolean(true);
         AtomicLong totalOps = new AtomicLong(0);
-        CountDownLatch latch = new CountDownLatch(numThreads);
+        CountDownLatch latch = new CountDownLatch(threads);
 
-        Runnable task = () -> {
-            while (isRunning.get()) {
-                int key = ThreadLocalRandom.current().nextInt(keyRange);
-                operation.accept(key, "value-" + key);
-                totalOps.incrementAndGet();
+        try {
+            for (int i = 0; i < threads; i++) {
+                executor.submit(() -> {
+                    long ops = 0;
+                    try {
+                        while (running.get()) {
+                            operation.run();
+                            ops++;
+                        }
+                    } finally {
+                        totalOps.addAndGet(ops);
+                        latch.countDown();
+                    }
+                });
             }
-            latch.countDown();
-        };
 
-        for (int i = 0; i < numThreads; i++) executor.submit(task);
-        Thread.sleep(TimeUnit.SECONDS.toMillis(duration));
-        isRunning.set(false);
-        latch.await(5, TimeUnit.SECONDS);
-        return totalOps.get();
+            long start = System.nanoTime();
+            Thread.sleep(TimeUnit.SECONDS.toMillis(THROUGHPUT_SECONDS));
+            running.set(false);
+            latch.await(30, TimeUnit.SECONDS);
+            double elapsedSeconds = (System.nanoTime() - start) / 1e9;
+            return totalOps.get() / elapsedSeconds;
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
-    private long[] runHitRateBenchmark(int capacity, int keyRange, int duration, BiConsumer<Integer, String> put, Function<Integer, String> get) throws InterruptedException {
-        AtomicBoolean isRunning = new AtomicBoolean(true);
-        AtomicLong hits = new AtomicLong(0);
-        AtomicLong misses = new AtomicLong(0);
-        CountDownLatch latch = new CountDownLatch(numThreads);
+    /**
+     * Drives a read-through workload: a miss is followed by an insert, which is how a cache is
+     * actually used and the only way its capacity gets exercised.
+     *
+     * @return {@code {hits, misses}}
+     */
+    private static long[] measureHitRate(ZipfKeys zipf,
+                                         Function<Integer, String> get,
+                                         BiConsumer<Integer, String> put) {
+        long hits = 0;
+        long misses = 0;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(HIT_RATE_SECONDS);
 
-        // Zipfian generator to simulate realistic access patterns
-        class SimpleZipfianGenerator {
-            private final ThreadLocalRandom random = ThreadLocalRandom.current();
-            private final double skew = 0.99;
-            private final double bottom = 1.0 / Math.pow(keyRange, 1.0 - skew);
-            public int nextInt() {
-                double r = random.nextDouble() * bottom;
-                return (int) Math.floor(Math.pow(r, 1.0 / (1.0 - skew)));
-            }
-        }
-        final SimpleZipfianGenerator zipf = new SimpleZipfianGenerator();
-
-        Runnable task = () -> {
-            while (isRunning.get()) {
-                int key = zipf.nextInt();
-                if (ThreadLocalRandom.current().nextInt(10) < 8) { // 80% reads
-                    if (get.apply(key) != null) {
-                        hits.incrementAndGet();
-                    } else {
-                        misses.incrementAndGet();
-                    }
-                } else { // 20% writes
+        while (System.nanoTime() < deadline) {
+            // Check the clock once per block of operations; System.nanoTime costs about as much
+            // as the cache operation being measured.
+            for (int i = 0; i < 1024; i++) {
+                int key = zipf.next();
+                if (get.apply(key) != null) {
+                    hits++;
+                } else {
+                    misses++;
                     put.accept(key, "value-" + key);
                 }
             }
-            latch.countDown();
-        };
-
-        for (int i = 0; i < numThreads; i++) executor.submit(task);
-        Thread.sleep(TimeUnit.SECONDS.toMillis(duration));
-        isRunning.set(false);
-        latch.await(5, TimeUnit.SECONDS);
-        return new long[]{hits.get(), misses.get()};
+        }
+        return new long[]{hits, misses};
     }
-
-    // --- Functional Interfaces for Lambdas ---
-    @FunctionalInterface
-    interface BiConsumer<T, U> { void accept(T t, U u); }
-    @FunctionalInterface
-    interface Function<T, R> { R apply(T t); }
 }

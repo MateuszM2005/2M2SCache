@@ -11,12 +11,29 @@ import java.util.concurrent.locks.ReentrantLock;
  * 4-bit counters packed into an AtomicLongArray to save space. It employs four
  * hash functions to update and estimate the frequency of an item.
  *
+ * Each of the four counters for an item is addressed by an independent
+ * multiplicative hash, so two items that collide in one row are very unlikely to
+ * collide in the others. That independence is what makes the minimum of the four
+ * a better estimate than any single counter.
+ *
  * The sketch periodically resets by halving all counters to adapt to changes
  * in access patterns over time (a form of aging).
  */
 class Sketch {
-    private static final int SEED_1 = 0xc3a5c85c;
-    private static final int SEED_2 = 0x811c9dc5;
+    private static final int ROWS = 4;
+
+    /**
+     * One 64-bit multiplier per row. Distinct odd constants with well mixed bits, so
+     * {@link #indexOf} produces uncorrelated indices for the same item.
+     */
+    private static final long[] SEED = {
+            0xc3a5c85c97cb3127L,
+            0xb492b66fbe98f273L,
+            0x9ae16a3b2f90404fL,
+            0xcbf29ce484222325L
+    };
+
+    private static final long RESET_MASK = 0x7777777777777777L;
 
     private final int sampleSize;
     private final int tableMask;
@@ -38,36 +55,36 @@ class Sketch {
     }
 
     /**
-     * Increments the frequency count for an element with the given hash.
-     * This involves incrementing four different counters in the sketch.
-     * If the total number of increments exceeds the sample size, a reset is triggered.
+     * Adds to the frequency count for an element, incrementing each of its four counters.
+     * Does not update the sample total; callers batching several items should report the
+     * total once via {@link #addSamples(int)}.
      *
-     * @param hash The hash code of the element.
+     * @param hash  The hash code of the element.
+     * @param count How many accesses to record.
      */
-    public void increment(int hash) {
-        if (size.get() >= sampleSize) {
-            if (resetLock.tryLock()) {
-                try {
-                    if (size.get() >= sampleSize) {
-                        reset();
-                    }
-                } finally {
-                    resetLock.unlock();
+    void increment(int hash, int count) {
+        int spread = spread(hash);
+        for (int row = 0; row < ROWS; row++) {
+            incrementCounter(indexOf(spread, row), count);
+        }
+    }
+
+    /**
+     * Records that {@code count} accesses were observed, and resets the sketch once the
+     * running total passes the sample size.
+     *
+     * @param count How many accesses were recorded since the last call.
+     */
+    void addSamples(int count) {
+        if (size.addAndGet(count) >= sampleSize && resetLock.tryLock()) {
+            try {
+                if (size.get() >= sampleSize) {
+                    reset();
                 }
+            } finally {
+                resetLock.unlock();
             }
         }
-        size.incrementAndGet();
-
-        int start = hash & tableMask;
-        int index0 = start;
-        int index1 = (start + SEED_1) & tableMask;
-        int index2 = (start + SEED_2) & tableMask;
-        int index3 = (start + (SEED_1 ^ SEED_2)) & tableMask;
-
-        incrementCounter(index0);
-        incrementCounter(index1);
-        incrementCounter(index2);
-        incrementCounter(index3);
     }
 
     /**
@@ -79,41 +96,56 @@ class Sketch {
      * @return The estimated frequency.
      */
     public int frequency(int hash) {
-        int start = hash & tableMask;
-        int index0 = start;
-        int index1 = (start + SEED_1) & tableMask;
-        int index2 = (start + SEED_2) & tableMask;
-        int index3 = (start + (SEED_1 ^ SEED_2)) & tableMask;
-
-        int min = readCounter(index0);
-        min = Math.min(min, readCounter(index1));
-        min = Math.min(min, readCounter(index2));
-        min = Math.min(min, readCounter(index3));
+        int spread = spread(hash);
+        int min = Integer.MAX_VALUE;
+        for (int row = 0; row < ROWS; row++) {
+            min = Math.min(min, readCounter(indexOf(spread, row)));
+        }
         return min;
-
     }
 
     /**
-     * Increments a specific 4-bit counter.
+     * Mixes a key's hash code so that poorly distributed hash codes, such as the identity
+     * hash of small integers, do not land in a narrow band of counters.
+     */
+    static int spread(int hash) {
+        hash = ((hash >>> 16) ^ hash) * 0x45d9f3b;
+        hash = ((hash >>> 16) ^ hash) * 0x45d9f3b;
+        return (hash >>> 16) ^ hash;
+    }
+
+    /**
+     * Maps an already spread hash to a counter index for one row.
+     */
+    private int indexOf(int spread, int row) {
+        long hash = (spread + SEED[row]) * SEED[row];
+        hash += hash >>> 32;
+        return ((int) hash) & tableMask;
+    }
+
+    /**
+     * Adds to a specific 4-bit counter, saturating at 15.
      * This is a lock-free operation using CAS on the containing long.
      *
      * @param index The index of the counter to increment.
+     * @param count How much to add.
      */
-    private void incrementCounter(int index) {
+    private void incrementCounter(int index, int count) {
         int block = index >>> 4;
         int offset = (index & 15) << 2;
         long mask = 0xFL << offset;
 
         while (true) {
             long current = table.get(block);
-            long count = (current & mask) >>> offset;
+            long value = (current & mask) >>> offset;
 
-            if (count < 15) {
-                long next = (current & ~mask) | ((count + 1) << offset);
-                if (table.compareAndSet(block, current, next)) {
-                    return;
-                }
-            } else {
+            if (value >= 15) {
+                return;
+            }
+
+            long updated = Math.min(15, value + count);
+            long next = (current & ~mask) | (updated << offset);
+            if (table.compareAndSet(block, current, next)) {
                 return;
             }
         }
@@ -136,8 +168,8 @@ class Sketch {
      */
     private void reset() {
         for (int i = 0; i < table.length(); i++) {
-            table.set(i, (table.get(i) >>> 1) & 0x7777777777777777L);
+            table.set(i, (table.get(i) >>> 1) & RESET_MASK);
         }
-        size.set(size.get() >>> 1);
+        size.getAndUpdate(current -> current >>> 1);
     }
 }

@@ -1,4 +1,4 @@
-name: Build JAR
+name: Build
 
 on:
   push:
@@ -24,14 +24,7 @@ jobs:
       - name: Compile
         run: |
           mkdir -p out/classes
-          javac --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
-            -d out/classes \
-            src/Main.java \
-            src/concurrent/*.java
-
-      - name: Package JAR
-        run: |
-          jar --create --file 2M2SCache.jar --main-class Main -C out/classes .
+          javac -Xlint:all -d out/classes src/concurrent/*.java
 
       - name: Download JUnit
         run: |
@@ -41,21 +34,15 @@ jobs:
       - name: Compile tests
         run: |
           mkdir -p out/test-classes
-          javac --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
+          javac -Xlint:all \
             -cp junit-platform-console-standalone.jar:out/classes \
             -d out/test-classes \
             src/test/*.java
 
       - name: Run tests
         run: |
-          java --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
+          java -ea \
             -jar junit-platform-console-standalone.jar execute \
             --class-path out/classes:out/test-classes \
-            --scan-class-path \
+            --scan-class-path=out/test-classes \
             --fail-if-no-tests
-
-      - name: Upload JAR
-        uses: actions/upload-artifact@v4
-        with:
-          name: 2M2SCache
-          path: 2M2SCache.jar

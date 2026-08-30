@@ -1,6 +1,13 @@
 package concurrent;
 
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
+
+import static concurrent.Node.LOC_NEW;
+import static concurrent.Node.LOC_PROBATION;
+import static concurrent.Node.LOC_PROTECTED;
+import static concurrent.Node.LOC_UNLINKED;
+import static concurrent.Node.LOC_WINDOW;
 
 
 /**
@@ -29,12 +36,6 @@ import java.util.concurrent.ConcurrentHashMap;
  * @param <V> the type of mapped values
  */
 public class Cache2M2S<K, V> {
-    final int LOC_UNLINKED = -1;
-    final int LOC_NEW = 0;
-    final int LOC_WINDOW = 1;
-    final int LOC_PROBATION = 2;
-    final int LOC_PROTECTED = 3;
-
     private final int MAX_SIZE;
     private final int WINDOW_SIZE;
     private final int PROBATION_SIZE;
@@ -46,10 +47,28 @@ public class Cache2M2S<K, V> {
     private final Queue<K, V> probationLRU;
     private final Queue<K, V> windowLRU;
 
-    private final Buffer<K, V> buffer;
+    /**
+     * Records that must be processed: a new node needs linking into a queue before it can ever
+     * be evicted, a deleted node needs unlinking, and a probation access promotes. These
+     * cannot be discarded.
+     */
+    private final Buffer<K, V> writeBuffer;
+
+    /**
+     * Records that only refresh recency on the window or protected queues. Under pressure
+     * these are discarded rather than making the caller wait: a missed move-to-front
+     * blurs LRU slightly, which the policy already treats as an approximation.
+     */
+    private final Buffer<K, V> readBuffer;
+
+    /**
+     * Guards all queue mutation. Shared by both buffers, because a drain of either one
+     * reorders the same three queues.
+     */
+    private final ReentrantLock bufferLock = new ReentrantLock();
 
 
-    private final ThreadLocal<Batch<K>> batch =
+    private final ThreadLocal<Batch> batch =
             ThreadLocal.withInitial(Batch::new);
     private final Sketch sketch;
 
@@ -68,7 +87,9 @@ public class Cache2M2S<K, V> {
         this.windowLRU = new Queue<>(WINDOW_SIZE);
 
         this.sketch = new Sketch(MAX_SIZE * 4);
-        this.buffer = new Buffer<>(this);
+        int rings = defaultRings();
+        this.writeBuffer = new Buffer<>(this, bufferLock, false, 1, 4096);
+        this.readBuffer = new Buffer<>(this, bufferLock, true, rings, 1024);
     }
 
     /**
@@ -80,14 +101,29 @@ public class Cache2M2S<K, V> {
         MAX_CAPACITY = Math.max(MAX_CAPACITY, 10000);
         PROTECTION_SIZE = (int) (MAX_CAPACITY * 0.8);
         PROBATION_SIZE = (int) (MAX_CAPACITY * 0.19);
-        WINDOW_SIZE = (int) (MAX_CAPACITY * 0.1);
+        WINDOW_SIZE = (int) (MAX_CAPACITY * 0.01);
         this.MAX_SIZE = PROBATION_SIZE + PROTECTION_SIZE + WINDOW_SIZE;
-        this.buffer = new Buffer<>(this);
         this.cache = new ConcurrentHashMap<>(MAX_SIZE);
         this.protectedLRU = new Queue<>(PROTECTION_SIZE);
         this.probationLRU = new Queue<>(PROBATION_SIZE);
         this.windowLRU = new Queue<>(WINDOW_SIZE);
         this.sketch = new Sketch(MAX_SIZE * 4);
+        int rings = defaultRings();
+        this.writeBuffer = new Buffer<>(this, bufferLock, false, 1, 4096);
+        this.readBuffer = new Buffer<>(this, bufferLock, true, rings, 1024);
+    }
+
+    /**
+     * At most four rings, and never more rings than cores. Four is the cap because 4096
+     * slots divided further makes each drain too shallow for a minimum-sized cache.
+     */
+    private static int defaultRings() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        int rings = 1;
+        while (rings < 4 && rings < cores) {
+            rings <<= 1;
+        }
+        return rings;
     }
 
     /**
@@ -102,7 +138,7 @@ public class Cache2M2S<K, V> {
         Node<K, V> node = cache.get(key);
         if (node != null) {
             node.value = value;
-            nudge(node);
+            afterRead(node);
             return;
         }
 
@@ -111,11 +147,11 @@ public class Cache2M2S<K, V> {
 
         if (existingNode != null) {
             existingNode.value = value;
-            nudge(existingNode);
+            afterRead(existingNode);
             return;
         }
 
-        nudge(newNode);
+        afterWrite(newNode);
     }
 
     /**
@@ -128,7 +164,7 @@ public class Cache2M2S<K, V> {
     public V get(K key) {
         Node<K, V> node = cache.get(key);
         if (node != null) {
-            nudge(node);
+            afterRead(node);
             return node.value;
         }
         return null;
@@ -144,7 +180,7 @@ public class Cache2M2S<K, V> {
         Node<K, V> node = cache.remove(key);
         if (node != null) {
             node.isDeleted = true;
-            nudge(node);
+            afterWrite(node);
         }
     }
 
@@ -165,7 +201,6 @@ public class Cache2M2S<K, V> {
     protected void evict(){
         if(windowLRU.full()){
             Node<K, V> evicted = windowLRU.back();
-            if(evicted.queueType == -2) System.err.println("critical error");
             windowLRU.unlink(evicted);
             evicted.queueType = LOC_UNLINKED;
             if(evicted.isDeleted) {return;}
@@ -248,15 +283,37 @@ public class Cache2M2S<K, V> {
         }
     }
 
+    int drainBuffers() {
+        return readBuffer.drain() + writeBuffer.drain();
+    }
+
     /**
-     * "Nudges" a node to signify it has been accessed. This involves incrementing its
-     * frequency in the sketch and adding it to the buffer for processing.
+     * Records an access that only refreshes recency. The frequency estimate always counts it;
+     * the queue reordering is best effort and may be discarded under pressure, except for
+     * probation: an access there promotes, and dropping promotions is what collapsed
+     * occupancy to the window-plus-probation 20%.
      *
      * @param node The node that was accessed.
      */
-    private void nudge(Node<K, V> node) {
+    private void afterRead(Node<K, V> node) {
         batch.get().increment(node.hash, sketch);
-        buffer.offer(node);
+        if (node.queueType == LOC_PROBATION || node.queueType == LOC_NEW || node.isDeleted) {
+            writeBuffer.offer(node);
+            return;
+        }
+        readBuffer.offer(node);
+    }
+
+    /**
+     * Records an access that changes what the queues must contain, so the record cannot be
+     * skipped or dropped. A new node that is never linked into a queue is never evicted, and a
+     * deleted node that is never unlinked holds its slot forever.
+     *
+     * @param node The node that was inserted or deleted.
+     */
+    private void afterWrite(Node<K, V> node) {
+        batch.get().increment(node.hash, sketch);
+        writeBuffer.offer(node);
     }
 
 }

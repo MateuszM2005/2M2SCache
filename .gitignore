@@ -1,11 +1,12 @@
 # IntelliJ IDEA
 .idea/
+*.iml
 
 # Compiler output
 out/
 *.class
 
-# Packaged artifacts (CI uploads these)
+# Downloaded / local artifacts
 *.jar
 *.war
 *.ear
@@ -14,3 +15,5 @@ out/
 .DS_Store
 Thumbs.db
 *~
+.vscode/
+
